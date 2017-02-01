@@ -34,20 +34,7 @@ class LogStash::Codecs::Gelf < LogStash::Codecs::Base
   # The following additional severity_labels from logstash's  syslog_pri filter
   # are accepted: "emergency", "alert", "critical",  "warning", "notice", and
   # "informational"
-  config :level, :validate => :array, :default => [ "%{severity}" ]
-
-  # The GELF facility. Dynamic values like %{foo} are permitted here; this
-  # is useful if you need to use a value from the event as the facility name.
-  config :facility, :validate => :string, :deprecated => true
-
-  # The GELF line number; this is usually the line number in your program where
-  # the log event originated. Dynamic values like %{foo} are permitted here, but the
-  # value should be a number.
-  config :line, :validate => :string, :deprecated => true
-
-  # The GELF file; this is usually the source code file in your program where
-  # the log event originated. Dynamic values like %{foo} are permitted here.
-  config :file, :validate => :string, :deprecated => true
+  config :level, :validate => :array, :default => [ "%{severity}", "INFO" ]
 
   # Ship metadata within event object? This will cause logstash to ship
   # any fields in the event (such as those created by grok) in the GELF
@@ -57,9 +44,6 @@ class LogStash::Codecs::Gelf < LogStash::Codecs::Base
   # Ship tags within events. This will cause logstash to ship the tags of an
   # event as the field _tags.
   config :ship_tags, :validate => :boolean, :default => true
-
-  # Ship timestamp to float epoch
-  config :ship_timestamp, :validate => :boolean, :default => true
 
   # Ignore these fields when ship_metadata is set. Typically this lists the
   # fields used in dynamic values for GELF fields.
@@ -189,58 +173,51 @@ class LogStash::Codecs::Gelf < LogStash::Codecs::Base
   public
   def encode(event)
     @logger.debug("encode(event)", event.to_hash)
-    event.set("version", @gelf_version)
 
-    event.set("short_message", event.get("message"))
+    m = Hash.new()
+
+    m["version"] = @gelf_version
+
+    m["short_message"] = event.get("message")
     if event.get(@short_message)
       v = event.get(@short_message)
       short_message = (v.is_a?(Array) && v.length == 1) ? v.first : v
       short_message = short_message.to_s
       if !short_message.empty?
-        event.set("short_message", short_message)
+        m["short_message"] = short_message
       end
     end
 
-    event.set("full_message", event.sprintf(@full_message)) if event.get("full_message").nil? or event.get("full_message").empty?
+    m["full_message"] = event.sprintf(@full_message)
 
-    event.set("host", event.sprintf(@sender))
+    m["host"] = event.sprintf(@sender)
 
-    # deprecated fields
-    event.set("facility", event.sprintf(@facility)) if @facility
-    event.set("file", event.sprintf(@file)) if @file
-    event.set("line", event.sprintf(@line)) if @line
-    event.set("line", event.get("line").to_i) if event.get("line").is_a?(String) and event.get("line") === /^[\d]+$/
+    if @ship_metadata
+      event.to_hash.each do |name, value|
+        next if value == nil
+        next if name == "message"
+
+        # Trim leading '_' in the event
+        name = name[1..-1] if name.start_with?('_')
+        name = "_id" if name == "id"  # "_id" is reserved, so use "__id"
+        if !value.nil? and !@ignore_metadata.include?(name)
+          if value.is_a?(Array)
+            m["_#{name}"] = value.join(', ')
+          elsif value.is_a?(Hash)
+            value.each do |hash_name, hash_value|
+              m["_#{name}_#{hash_name}"] = hash_value
+            end
+          else
+            # Non array values should be presented as-is
+            # https://logstash.jira.com/browse/LOGSTASH-113
+            m["_#{name}"] = value
+          end
+        end
+      end
+    end
 
     if @ship_tags
-      unless event.get("tags").nil?
-        if event.get("tags").is_a?(Array)
-          event.set("_tags", event.get("tags").join(', '))
-        else
-          event.set("_tags", event.get("tags"))
-        end
-        event.remove("tags")
-      end
-    end
-    add_leading_underscore(event) if @add_leading_underscore
-
-    if @ship_timestamp
-      if event.get("timestamp").nil?
-        if !event.get('@timestamp').nil?
-          begin
-            dt = DateTime.parse(event.get("@timestamp").to_iso8601).to_time.to_f
-          rescue ArgumentError, NoMethodError
-            dt = nil
-          end
-          event.set("timestamp", dt) if !dt.nil?
-        end
-      else
-        begin
-          dt = DateTime.parse(event.get("timestamp").to_iso8601).to_time.to_f
-        rescue ArgumentError, NoMethodError
-          dt = nil
-        end
-        event.set("timestamp", dt) if !dt.nil?
-      end
+      m["_tags"] = event.get("tags").join(', ') if event.get("tags")
     end
 
     if @custom_fields
@@ -249,32 +226,26 @@ class LogStash::Codecs::Gelf < LogStash::Codecs::Base
       end
     end
 
-    # Probe levels/severity
-    if !event.get("level")
-      if !event.get("severity")
-        level = nil
-        if @level.is_a?(Array)
-          @level.each do |value|
-            unless value.nil?
-              parsed_value = event.sprintf(value) if !event.get("value").nil?
-              next if value.count('%{') > 0 and parsed_value == value
-              level = parsed_value.to_s
-              break
-            end
-          end
-        else
-          level = event.sprintf(@level.to_s)
-        end
-        event.set("level", (@level_map[level.downcase] || level).to_i) unless level.nil? or level.empty?
-      else
-        event.set("level", (@level_map[event.get("severity").downcase] || event.get("severity")).to_i) unless event.get("severity").nil? or event.get("severity").empty?
+    # Probe severity array levels
+    level = nil
+    if @level.is_a?(Array)
+      @level.each do |value|
+        parsed_value = event.sprintf(value)
+        next if value.count('%{') > 0 and parsed_value == value
+
+        level = parsed_value
+        break
       end
+    else
+      level = event.sprintf(@level.to_s)
     end
+    m["level"] = (level.respond_to?(:downcase) && @level_map[level.downcase] || level).to_i
+    m["timestamp"] = event.timestamp.to_f
 
     if @delimiter
-      @on_event.call(event, "#{event.to_json}#{@delimiter}")
+      @on_event.call(event, "#{m.to_json}#{@delimiter}")
     else
-     @on_event.call(event, event.to_json)
+      @on_event.call(event, m.to_json)
     end
   end # def encode
 
@@ -316,41 +287,6 @@ class LogStash::Codecs::Gelf < LogStash::Codecs::Base
        event.remove(key)
      end
   end # def strip_leading_underscores
-
-  def add_leading_underscore(event)
-     event.to_hash.keys.each do |key|
-       name = key
-       value = event.get(key)
-       next if name == "message"
-
-       # Trim leading '_' in the data
-       name = name[1..-1] if name.start_with?('_')
-       name = "_id" if name == "id"  # "_id" is reserved, so use "__id"
-
-       if !@ignore_metadata.include?(name)
-         if @ship_metadata
-           if value.nil?
-             event.set("_#{name}", nil)
-           elsif value.is_a?(Array)
-             event.set("_#{name}", value.join(', '))
-           elsif value.is_a?(Hash)
-             value.each do |hash_name, hash_value|
-                event.set("_#{name}_#{hash_name}", hash_value)
-             end
-           else
-             # Non array values should be presented as-is
-             # https://logstash.jira.com/browse/LOGSTASH-113
-             event.set("_#{name}", value)
-           end
-           event.remove(name)
-         else
-           event.set("_#{name}", value)
-           event.remove(name)
-         end
-       end
-     end
-     @logger.debug("after (add_leading_underscore)", event.to_hash)
-  end # def add_leading_underscore
 
   # from_json_parse uses the Event#from_json method to deserialize and directly produce events
   def from_json_parse(json, &block)
